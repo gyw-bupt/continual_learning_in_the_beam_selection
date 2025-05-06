@@ -1,4 +1,3 @@
-from . import mlp
-from . import lenet
-from . import resnet
-from . import senet
+from . import lidarnet
+from . import coordnet
+from . import fusion

@@ -18,8 +18,7 @@ class L2(NormalNN):
         self.params = {n: p for n, p in self.model.named_parameters() if p.requires_grad}  # For convenience
         self.regularization_terms = {}
         self.task_count = 0
-        self.online_reg = True  # True: There will be only one importance matrix and previous model parameters
-                                # False: Each task has its own importance matrix and model parameters
+        self.online_reg = True
 
     def calculate_importance(self, dataloader):
         # Use an identity importance so it is an L2 regularization.
@@ -28,12 +27,10 @@ class L2(NormalNN):
             importance[n] = p.clone().detach().fill_(1)  # Identity
         return importance
 
-    def learn_batch(self, train_loader, val_loader=None):
-
-        self.log('#reg_term:', len(self.regularization_terms))
-
+    def learn_batch(self, train_name, train_loader, val_loader_task=None, test_loader_task1=None, test_loader_task2 = None, modelname=None
+                    ):
         # 1.Learn the parameters for current task
-        super(L2, self).learn_batch(train_loader, val_loader)
+        metrics = super(L2, self).learn_batch(train_name, train_loader, val_loader_task, test_loader_task1, test_loader_task2, modelname)
 
         # 2.Backup the weight of current task
         task_param = {}
@@ -41,19 +38,22 @@ class L2(NormalNN):
             task_param[n] = p.clone().detach()
 
         # 3.Calculate the importance of weights for current task
-        importance = self.calculate_importance(train_loader)
+        if train_name == 1:
+            importance = self.calculate_importance(train_loader)
 
         # Save the weight and importance of weights of current task
-        self.task_count += 1
-        if self.online_reg and len(self.regularization_terms)>0:
-            # Always use only one slot in self.regularization_terms
-            self.regularization_terms[1] = {'importance':importance, 'task_param':task_param}
-        else:
-            # Use a new slot to store the task-specific information
-            self.regularization_terms[self.task_count] = {'importance':importance, 'task_param':task_param}
+            self.task_count += 1
+            if self.online_reg and len(self.regularization_terms)>0:
+                # Always use only one slot in self.regularization_terms
+                self.regularization_terms[1] = {'importance':importance, 'task_param':task_param}
+            else:
+                # Use a new slot to store the task-specific information
+                self.regularization_terms[self.task_count] = {'importance':importance, 'task_param':task_param}
 
-    def criterion(self, inputs, targets, tasks, regularization=True, **kwargs):
-        loss = super(L2, self).criterion(inputs, targets, tasks, **kwargs)
+        return metrics
+
+    def criterion(self, inputs, targets, regularization=True, **kwargs):
+        loss = super(L2, self).criterion(inputs, targets,  **kwargs)
 
         if regularization and len(self.regularization_terms)>0:
             # Calculate the reg_loss only when the regularization_terms exists
@@ -100,7 +100,7 @@ class EWC(L2):
             for n, p in self.params.items():
                 importance[n] = p.clone().detach().fill_(0)  # zero initialized
 
-        # Sample a subset (n_fisher_sample) of data to estimate the fisher information (batch_size=1)
+        # Sample a subset (n_fisher_sample) of Raymobtime to estimate the fisher information (batch_size=1)
         # Otherwise it uses mini-batches for the estimation. This speeds up the process a lot with similar performance.
         if self.n_fisher_sample is not None:
             n_sample = min(self.n_fisher_sample, len(dataloader.dataset))
@@ -113,38 +113,23 @@ class EWC(L2):
         self.eval()
 
         # Accumulate the square of gradients
-        for i, (input, target, task) in enumerate(dataloader):
+        for i, (input_coord, input_lidar, target) in enumerate(dataloader):
             if self.gpu:
-                input = input.cuda()
+                input_coord = input_coord.cuda()
+                input_lidar = input_lidar.cuda()
                 target = target.cuda()
 
-            preds = self.forward(input)
-
-            # Sample the labels for estimating the gradients
-            # For multi-headed model, the batch of data will be from the same task,
-            # so we just use task[0] as the task name to fetch corresponding predictions
-            # For single-headed model, just use the max of predictions from preds['All']
-            task_name = task[0] if self.multihead else 'All'
-
-            # The flag self.valid_out_dim is for handling the case of incremental class learning.
-            # if self.valid_out_dim is an integer, it means only the first 'self.valid_out_dim' dimensions are used
-            # in calculating the loss.
-            pred = preds[task_name] if not isinstance(self.valid_out_dim, int) else preds[task_name][:,:self.valid_out_dim]
-            ind = pred.max(1)[1].flatten()  # Choose the one with max
-
-            # - Alternative ind by multinomial sampling. Its performance is similar. -
-            # prob = torch.nn.functional.softmax(preds['All'],dim=1)
-            # ind = torch.multinomial(prob,1).flatten()
-
+            preds = self.forward(input_lidar, input_coord)
+            ind = preds.max(1)[1].flatten()  # Choose the one with max
             if self.empFI:  # Use groundtruth label (default is without this)
                 ind = target
 
-            loss = self.criterion(preds, ind, task, regularization=False)
+            loss = self.criterion(preds, ind, regularization=False)
             self.model.zero_grad()
             loss.backward()
             for n, p in importance.items():
                 if self.params[n].grad is not None:  # Some heads can have no grad if no loss applied on them.
-                    p += ((self.params[n].grad ** 2) * len(input) / len(dataloader))
+                    p += ((self.params[n].grad ** 2) * len(input_coord) / len(dataloader))
 
         self.train(mode=mode)
 
@@ -181,7 +166,7 @@ class SI(L2):
         for n, p in self.params.items():
             self.initial_params[n] = p.clone().detach()
 
-    def update_model(self, inputs, targets, tasks):
+    def update_model(self, input_lidar, input_coord, targets):
 
         unreg_gradients = {}
         
@@ -191,8 +176,8 @@ class SI(L2):
             old_params[n] = p.clone().detach()
 
         # 2. Collect the gradients without regularization term
-        out = self.forward(inputs)
-        loss = self.criterion(out, targets, tasks, regularization=False)
+        out = self.forward(input_lidar, input_coord)
+        loss = self.criterion(out, targets, regularization=False)
         self.optimizer.zero_grad()
         loss.backward(retain_graph=True)
         for n, p in self.params.items():
@@ -200,7 +185,7 @@ class SI(L2):
                 unreg_gradients[n] = p.grad.clone().detach()
 
         # 3. Normal update with regularization
-        loss = self.criterion(out, targets, tasks, regularization=True)
+        loss = self.criterion(out, targets, regularization=True)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -294,26 +279,15 @@ class MAS(L2):
         self.eval()
 
         # Accumulate the gradients of L2 loss on the outputs
-        for i, (input, target, task) in enumerate(dataloader):
+        for i, (coord_input, lidar_input, target) in enumerate(dataloader):
             if self.gpu:
-                input = input.cuda()
+                coord_input = coord_input.cuda()
+                lidar_input = lidar_input.cuda()
                 target = target.cuda()
 
-            preds = self.forward(input)
-
-            # Sample the labels for estimating the gradients
-            # For multi-headed model, the batch of data will be from the same task,
-            # so we just use task[0] as the task name to fetch corresponding predictions
-            # For single-headed model, just use the max of predictions from preds['All']
-            task_name = task[0] if self.multihead else 'All'
-
-            # The flag self.valid_out_dim is for handling the case of incremental class learning.
-            # if self.valid_out_dim is an integer, it means only the first 'self.valid_out_dim' dimensions are used
-            # in calculating the  loss.
-            pred = preds[task_name] if not isinstance(self.valid_out_dim, int) else preds[task_name][:,:self.valid_out_dim]
-
-            pred.pow_(2)
-            loss = pred.mean()
+            preds = self.forward(lidar_input, coord_input)
+            preds = preds.pow(2)
+            loss = preds.mean()
 
             self.model.zero_grad()
             loss.backward()
